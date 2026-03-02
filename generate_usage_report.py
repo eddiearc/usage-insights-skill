@@ -239,6 +239,7 @@ class EvidenceData:
     patterns: dict[str, Any] = field(default_factory=dict)
     insights: list[str] = field(default_factory=list)
     raw_counts: dict[str, Any] = field(default_factory=dict)
+    session_samples: list[dict[str, Any]] = field(default_factory=list)  # 抽样复盘数据
 
 
 def parse_iso(value: str | None) -> datetime | None:
@@ -965,6 +966,109 @@ def build_diagnostic_cards(metrics: list[DiagnosticMetric], empty_text: str) -> 
     return "".join(blocks)
 
 
+def sample_recent_sessions(
+    claude_dir: Path,
+    codex_history: Path,
+    limit: int = 20
+) -> list[dict[str, Any]]:
+    """抽样最近 N 个 session 的详细内容用于复盘分析"""
+    samples: list[dict[str, Any]] = []
+
+    # 从 Claude Code 收集 sessions
+    session_dir = claude_dir / "session-meta"
+    facets_dir = claude_dir / "facets"
+
+    if session_dir.exists():
+        session_files = sorted(session_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in session_files[:limit]:
+            payload = load_json(path)
+            if not payload:
+                continue
+
+            session_id = path.stem
+            start_time = payload.get("start_time", "")
+            first_prompt = str(payload.get("first_prompt", ""))[:200]  # 截断避免过长
+
+            # 加载 facets 数据（如果有）
+            facets_path = facets_dir / f"{session_id}.json"
+            facets = load_json(facets_path) or {}
+
+            # 提取 tool 使用序列
+            tool_sequence = list(payload.get("tool_counts", {}).keys())
+
+            samples.append({
+                "source": "claude",
+                "session_id": session_id,
+                "start_time": start_time,
+                "first_prompt": first_prompt,
+                "user_message_count": payload.get("user_message_count", 0),
+                "tool_count": len(tool_sequence),
+                "tool_sequence": tool_sequence[:10],  # 前10个工具
+                "outcome": facets.get("outcome", "unknown"),
+                "friction_types": list(facets.get("friction_counts", {}).keys())[:3],
+                "project_path": payload.get("project_path", ""),
+            })
+
+    # 从 Codex CLI 收集 sessions
+    if codex_history.exists():
+        # 先收集所有消息，按 session 分组
+        session_msgs: dict[str, list[dict]] = {}
+        with codex_history.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                    sid = str(payload.get("session_id", ""))
+                    if sid:
+                        if sid not in session_msgs:
+                            session_msgs[sid] = []
+                        session_msgs[sid].append({
+                            "text": str(payload.get("text", ""))[:150],
+                            "ts": payload.get("ts", 0),
+                        })
+                except json.JSONDecodeError:
+                    continue
+
+        # 取最近的 session
+        recent_sessions = sorted(
+            session_msgs.items(),
+            key=lambda x: max(m.get("ts", 0) for m in x[1]) if x[1] else 0,
+            reverse=True
+        )[:limit]
+
+        for session_id, msgs in recent_sessions:
+            if not msgs:
+                continue
+            # 按时间排序
+            msgs_sorted = sorted(msgs, key=lambda m: m.get("ts", 0))
+            first_msg = msgs_sorted[0]
+            last_msg = msgs_sorted[-1]
+
+            # 检测意图
+            texts = [m["text"] for m in msgs_sorted[:5]]  # 前5条消息
+            intent = classify_codex_intent(texts[0]) if texts else "other"
+
+            # 检测是否有返工信号
+            has_rework = any(has_any_pattern(t, FOLLOWUP_PATTERNS) for t in texts)
+            has_verification = any(has_any_pattern(t, VERIFICATION_PATTERNS) for t in texts)
+
+            samples.append({
+                "source": "codex",
+                "session_id": session_id,
+                "message_count": len(msgs),
+                "first_prompt": texts[0][:200] if texts else "",
+                "intent": intent,
+                "has_rework_signal": has_rework,
+                "has_verification_signal": has_verification,
+            })
+
+    # 按时间排序，取最近的 N 个
+    samples.sort(key=lambda x: x.get("start_time", ""), reverse=True)
+    return samples[:limit]
+
+
 def generate_evidence_json(evidence: EvidenceData, output_path: Path) -> None:
     """生成证据 JSON 文件，供 Agent 分析使用"""
     evidence_dict = {
@@ -977,13 +1081,14 @@ def generate_evidence_json(evidence: EvidenceData, output_path: Path) -> None:
             "top_tools": evidence.patterns.get("top_tools", []),
         },
         "raw_counts": evidence.raw_counts,
+        "session_samples": evidence.session_samples,  # 抽样复盘数据
         "analysis_prompt": """
 基于以上证据数据，请进行 Agentic 深度分析：
 
 1. **核心洞察**: 从数据中发现的最重要 3 个使用模式或问题
 2. **优势强化**: 基于高分维度，建议如何进一步放大优势
 3. **改进优先级**: 基于低分维度，给出具体可执行的改进步骤
-4. **证据锚点**: 每个结论都应指向具体的数据指标
+4. **抽样复盘**: 分析最近20个session样本中的具体行为模式
 
 请用简洁的语言给出可执行的建议。
 """
@@ -997,6 +1102,7 @@ def build_html_report(
     data: AggregatedData,
     assessment: UsageAssessment,
     evidence: EvidenceData,
+    session_samples: list[dict[str, Any]],
 ) -> str:
     tr = I18N[locale]
     dominant_lang = pick_dominant_language(data)
@@ -1022,12 +1128,14 @@ def build_html_report(
     project_items = top_items(data.project_counts, 6)
 
     # Agentic 区块 - 显示 placeholder，实际分析由执行 agent 完成
+    sample_summary = f"已抽取最近 {len(session_samples)} 个 session 样本进行复盘分析"
     agentic_section = f"""
     <section class="agentic">
       <h2>{tr["section_agentic"]}</h2>
       <div class="agentic-placeholder">
         <p><em>{tr["agentic_placeholder"]}</em></p>
         <p>{tr["agentic_summary"]}</p>
+        <p class="sample-info"><strong>{sample_summary}</strong></p>
       </div>
       <h3>{tr["agentic_evidence_title"]}</h3>
       <div class="evidence-anchors">
@@ -1038,6 +1146,7 @@ def build_html_report(
           <li>验证覆盖率: {evidence.metrics.get("verification_rate", 0):.1%}</li>
           <li>规划覆盖率: {evidence.metrics.get("planning_rate", 0):.1%}</li>
           <li>高频摩擦: {", ".join([f"{k}({v})" for k, v in evidence.patterns.get("top_friction", [])[:3]]) or "无"}</li>
+          <li>抽样样本数: {len(session_samples)} 个 session</li>
         </ul>
         <p class="evidence-file">详细证据数据已保存至: <code>*.evidence.json</code></p>
       </div>
@@ -1256,8 +1365,12 @@ def main() -> None:
     locale = pick_locale(args.locale, data.language_chars, data.language_messages)
     assessment, evidence = build_assessment(locale, data)
 
+    # 抽样复盘：收集最近 20 个 session 的详细内容
+    session_samples = sample_recent_sessions(args.claude_dir, args.codex_history, limit=20)
+    evidence.session_samples = session_samples
+
     # 生成报告
-    html_content = build_html_report(locale, sources, data, assessment, evidence)
+    html_content = build_html_report(locale, sources, data, assessment, evidence, session_samples)
     args.output.write_text(html_content, encoding="utf-8")
 
     # 生成证据 JSON
