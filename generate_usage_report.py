@@ -908,6 +908,12 @@ def calculate_karpathy_agentic_score(data: AggregatedData, session_samples: list
     # 5 个维度的评估框架（供 AI 专家分析使用）
     criteria = KARPATHY_AGENTIC_CRITERIA[locale]
     
+    # 计算 explore_ratio 用于 interpretation
+    explore_intents = data.intent_counts.get("quick_question", 0) + data.intent_counts.get("debugging", 0)
+    implementation_intents = data.intent_counts.get("code_implementation", 0) + data.intent_counts.get("release_build", 0)
+    total_categorized = explore_intents + implementation_intents
+    explore_ratio = safe_div(explore_intents, total_categorized) if total_categorized > 0 else 0
+    
     analysis_framework = {
         "orchestration": {
             "id": "orchestration",
@@ -1001,7 +1007,7 @@ def calculate_karpathy_agentic_score(data: AggregatedData, session_samples: list
     }
 
 
-def build_assessment(locale: str, data: AggregatedData) -> tuple[UsageAssessment, EvidenceData]:
+def build_assessment(locale: str, data: AggregatedData, session_samples: list = None) -> tuple[UsageAssessment, EvidenceData]:
     """构建评估和证据数据"""
     tr = I18N[locale]
     total_sessions = max(1, data.total_sessions)
@@ -1118,7 +1124,7 @@ def build_assessment(locale: str, data: AggregatedData) -> tuple[UsageAssessment
             "planning_signals": data.planning_signals, "followup_signals": data.followup_signals,
             "outcomes": dict(data.outcome_counts), "friction": dict(data.friction_counts),
         },
-        karpathy_score=calculate_karpathy_agentic_score(data, session_samples, locale)
+        karpathy_score=calculate_karpathy_agentic_score(data, session_samples or [], locale)
     )
 
     strengths, weaknesses, next_steps = [], [], []
@@ -1439,44 +1445,71 @@ def build_html_report(
     </section>
     """
 
-    # Karpathy Agentic Score 区块
+    # Karpathy Agentic Score 区块 (AI 专家分析模式)
     karpathy = evidence.karpathy_score
     karpathy_dimensions_html = ""
-    if karpathy and "dimensions" in karpathy:
-        for dim in karpathy["dimensions"]:
-            width = dim["score"]
+    
+    if karpathy and karpathy.get("analysis_mode") == "ai_expert":
+        # AI 专家分析模式 - 显示分析框架而非具体分数
+        for dim_id, dim in karpathy.get("dimensions", {}).items():
+            indicators = ", ".join(dim.get("indicators", []))
+            raw_data_note = dim.get("raw_data", {}).get("note", "")
             karpathy_dimensions_html += f"""
-            <div class="score-row">
-              <div class="score-head">
-                <span>{html.escape(dim["name"])}</span>
-                <span>{dim["score"]}/100</span>
+            <div class="score-row" style="margin-bottom: 1.5rem; padding: 1rem; background: var(--surface-2); border-radius: 8px;">
+              <div class="score-head" style="font-weight: 600; color: var(--accent-2); margin-bottom: 0.5rem;">
+                {html.escape(dim.get("name", dim_id))}
               </div>
-              <div class="score-track"><div class="score-fill" style="width:{width:.2f}%"></div></div>
-              <div class="score-reason" style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.25rem;">
-                原文: {html.escape(dim["source"])}
+              <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 0.5rem;">
+                {html.escape(dim.get("description", ""))}
+              </div>
+              <div style="font-size: 0.8rem; color: var(--text-secondary);">
+                <strong>指标:</strong> {html.escape(indicators)}
+              </div>
+              <div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.5rem; font-style: italic;">
+                💡 {html.escape(raw_data_note)}
               </div>
             </div>
             """
-    
-    karpathy_section = f"""
-    <section class="karpathy-score">
-      <h2>🧠 Karpathy Agentic Engineering Score <span class="grade">{karpathy.get("total_score", 0)} / Grade {karpathy.get("grade", "N/A")}</span></h2>
-      <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 1rem;">
-        基于 Andrej Karpathy 的 Agentic Coding 理念评估 (From "Vibe Coding" → "Agentic Engineering")
-      </p>
-      {karpathy_dimensions_html}
-      <div class="karpathy-interpretation" style="margin-top: 1.5rem; padding: 1rem; background: var(--surface-2); border-radius: 8px;">
-        <h3 style="font-size: 0.95rem; margin: 0 0 0.75rem; color: var(--accent-2);">📊 维度解读</h3>
-        <ul style="margin: 0; padding-left: 1.2rem; font-size: 0.85rem; color: var(--text-secondary);">
-          <li><strong>编排能力:</strong> {karpathy.get("interpretation", {}).get("orchestration", "N/A")}</li>
-          <li><strong>先探索后编码:</strong> {karpathy.get("interpretation", {}).get("explore_first", "N/A")}</li>
-          <li><strong>质量监督:</strong> {karpathy.get("interpretation", {}).get("oversight", "N/A")}</li>
-          <li><strong>一次达成:</strong> {karpathy.get("interpretation", {}).get("first_pass", "N/A")}</li>
-          <li><strong>并行 Agent:</strong> {karpathy.get("interpretation", {}).get("parallel", "N/A")}</li>
-        </ul>
-      </div>
-    </section>
-    """
+        
+        ai_expert_badge = '<span style="background: var(--accent); color: white; padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.75rem; margin-left: 0.5rem;">AI Expert Mode</span>'
+        
+        karpathy_section = f"""
+        <section class="karpathy-score">
+          <h2>🧠 Karpathy Agentic Engineering Analysis {ai_expert_badge}</h2>
+          <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 1rem;">
+            基于 Andrej Karpathy 的 Agentic Coding 理念的评估框架。执行 agent 应基于下方的 session samples，扮演 Karpathy 进行专业分析。
+          </p>
+          <div style="background: var(--surface-2); padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem;">
+            <p style="margin: 0; font-size: 0.85rem; color: var(--accent-2);">
+              📋 分析说明: {html.escape(karpathy.get("note", ""))}
+            </p>
+          </div>
+          {karpathy_dimensions_html}
+        </section>
+        """
+    elif karpathy and "dimensions" in karpathy:
+        # 兼容旧模式 - 如果存在旧格式的数据
+        for dim_id, dim in karpathy.get("dimensions", {}).items() if isinstance(karpathy.get("dimensions"), dict) else []:
+            if isinstance(dim, dict) and "score" in dim:
+                width = dim["score"]
+                karpathy_dimensions_html += f"""
+                <div class="score-row">
+                  <div class="score-head">
+                    <span>{html.escape(dim.get("name", dim_id))}</span>
+                    <span>{dim["score"]}/100</span>
+                  </div>
+                  <div class="score-track"><div class="score-fill" style="width:{width:.2f}%"></div></div>
+                </div>
+                """
+        
+        karpathy_section = f"""
+        <section class="karpathy-score">
+          <h2>🧠 Karpathy Agentic Engineering Score</h2>
+          {karpathy_dimensions_html}
+        </section>
+        """
+    else:
+        karpathy_section = ""
 
     html_template = f"""<!DOCTYPE html>
 <html lang="{locale}">
@@ -1546,6 +1579,50 @@ def build_html_report(
       <div class="report-time">{tr["report_time"].format(time=fmt_datetime(datetime.now().astimezone(), locale))}</div>
     </header>
 
+    <!-- AI 专家评估 - 优先展示 -->
+    {karpathy_section}
+
+    <section class="strengths">
+      <h2>{tr["section_strengths"]}</h2>
+      {build_plain_list(assessment.strengths, tr["missing"])}
+    </section>
+
+    <section class="weaknesses">
+      <h2>{tr["section_weaknesses"]}</h2>
+      {build_plain_list(assessment.weaknesses, tr["missing"])}
+    </section>
+
+    <section class="next-steps">
+      <h2>{tr["section_next_steps"]}</h2>
+      {build_plain_list(assessment.next_steps, tr["missing"])}
+    </section>
+
+    <section class="insights">
+      <h2>{tr["section_insights"]}</h2>
+      {build_plain_list(insights, tr["missing"])}
+    </section>
+
+    {agentic_section}
+
+    <section class="score">
+      <h2>{tr["section_score"]} <span class="grade">{assessment.total_score} / {assessment.grade}</span></h2>
+      <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 1rem;">{tr["score_basis"]}</p>
+      {build_score_rows(assessment.dimensions)}
+    </section>
+
+    <section class="diagnostics">
+      <h2>{tr["section_diagnostics"]}</h2>
+      {build_diagnostic_cards(assessment.diagnostics, tr["missing"])}
+    </section>
+
+    <section class="trend">
+      <h2>{tr["section_trend"]}</h2>
+      <div class="trend-box">
+        {''.join(f'<div class="trend-line">{html.escape(line)}</div>' for line in assessment.trend_lines)}
+      </div>
+    </section>
+
+    <!-- 统计指标 - 次要展示 -->
     <section class="kpi">
       <h2>{tr["kpi_sessions"]} · {tr["kpi_user_msgs"]} · {tr["kpi_active_days"]} · {tr["kpi_lang"]}</h2>
       <div class="kpi-grid">
@@ -1574,48 +1651,6 @@ def build_html_report(
         {source_card(sources.get("claude", SourceStats("claude")), locale)}
         {source_card(sources.get("codex", SourceStats("codex")), locale)}
       </div>
-    </section>
-
-    {agentic_section}
-
-    {karpathy_section}
-
-    <section class="score">
-      <h2>{tr["section_score"]} <span class="grade">{assessment.total_score} / {assessment.grade}</span></h2>
-      <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 1rem;">{tr["score_basis"]}</p>
-      {build_score_rows(assessment.dimensions)}
-    </section>
-
-    <section class="diagnostics">
-      <h2>{tr["section_diagnostics"]}</h2>
-      {build_diagnostic_cards(assessment.diagnostics, tr["missing"])}
-    </section>
-
-    <section class="trend">
-      <h2>{tr["section_trend"]}</h2>
-      <div class="trend-box">
-        {''.join(f'<div class="trend-line">{html.escape(line)}</div>' for line in assessment.trend_lines)}
-      </div>
-    </section>
-
-    <section class="insights">
-      <h2>{tr["section_insights"]}</h2>
-      {build_plain_list(insights, tr["missing"])}
-    </section>
-
-    <section class="strengths">
-      <h2>{tr["section_strengths"]}</h2>
-      {build_plain_list(assessment.strengths, tr["missing"])}
-    </section>
-
-    <section class="weaknesses">
-      <h2>{tr["section_weaknesses"]}</h2>
-      {build_plain_list(assessment.weaknesses, tr["missing"])}
-    </section>
-
-    <section class="next-steps">
-      <h2>{tr["section_next_steps"]}</h2>
-      {build_plain_list(assessment.next_steps, tr["missing"])}
     </section>
 
     <section class="language">
@@ -1690,10 +1725,11 @@ def main() -> None:
 
     data = merge_aggregates(aggregates)
     locale = pick_locale(args.locale, data.language_chars, data.language_messages)
-    assessment, evidence = build_assessment(locale, data)
-
+    
     # 抽样复盘：收集最近 20 个 session 的详细内容
     session_samples = sample_recent_sessions(args.claude_dir, args.codex_history, limit=20)
+    
+    assessment, evidence = build_assessment(locale, data, session_samples)
     evidence.session_samples = session_samples
 
     # 生成报告
